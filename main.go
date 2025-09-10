@@ -207,16 +207,16 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	// val, err := strconv.Atoi(strings.Split(cfg.NodeID, "_")[2])
-	// if err != nil {
-	// 	logger.Fatal(err)
-	// }
+	val, err := strconv.Atoi(strings.Split(cfg.NodeID, "_")[2])
+	if err != nil {
+		logger.Fatal(err)
+	}
 
 	node := &Node{
-		ID:    cfg.NodeID,
-		TAgg:  tAgg,
-		Value: 512,
-		// Value:     float64(val),
+		ID:   cfg.NodeID,
+		TAgg: tAgg,
+		// Value: 512,
+		Value:     float64(val),
 		Flows:     make(map[string]float64),
 		Estimates: make(map[string]float64),
 		Rcvd:      make([]string, 0),
@@ -273,7 +273,7 @@ func main() {
 
 	r2 := http.NewServeMux()
 	r2.HandleFunc("GET /state", node.StateHandler)
-	log.Println("State server listening on :5001/metrics")
+	log.Println("State server listening on :5001/state")
 	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":5001", r2))
 }
 
