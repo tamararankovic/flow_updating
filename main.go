@@ -271,10 +271,10 @@ func main() {
 		log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
 	}()
 
-	r = http.NewServeMux()
-	r.HandleFunc("GET /state", node.StateHandler)
+	r2 := http.NewServeMux()
+	r2.HandleFunc("GET /state", node.StateHandler)
 	log.Println("State server listening on :5001/metrics")
-	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":5001", r))
+	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":5001", r2))
 }
 
 func sum(m map[string]float64) float64 {
