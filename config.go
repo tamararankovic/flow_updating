@@ -7,5 +7,4 @@ type Config struct {
 	ContactID   string `env:"CONTACT_NODE_ID"`
 	ContactAddr string `env:"CONTACT_NODE_ADDR"`
 	TAgg        string `env:"T_AGG"`
-	Expected    string `env:"EXPECTED"`
 }

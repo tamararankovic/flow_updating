@@ -16,6 +16,8 @@ FROM alpine:latest
 
 WORKDIR /app
 
+RUN mkdir -p /var/log/fu
+
 # Copy Go binaries
 COPY --from=builder  /main  ./main
 

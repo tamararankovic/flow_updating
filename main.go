@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/csv"
+	"fmt"
+	"io"
 	"log"
-	"math"
+	"net/http"
 	"os"
 	"slices"
 	"strconv"
@@ -36,7 +39,6 @@ type Node struct {
 	Hyparview *hyparview.HyParView
 	Lock      *sync.Mutex
 	Logger    *log.Logger
-	Expected  float64
 }
 
 func (n *Node) localEstimate() float64 {
@@ -118,16 +120,16 @@ func (n *Node) sendMsgs() {
 	ticker := time.NewTicker(time.Duration(n.TAgg) * time.Second)
 	defer ticker.Stop()
 
-	rounds := 0
+	// rounds := 0
 
 	for range ticker.C {
 		n.Lock.Lock()
-		if !equal(n.localEstimate(), n.Expected, n.Expected/100) {
-			rounds++
-		}
-		n.Logger.Printf("Expected estimate %.2f\n", n.Expected)
-		n.Logger.Printf("Current estimate %.2f\n", n.localEstimate())
-		n.Logger.Printf("Rounds to converge %d\n", rounds)
+		// if !equal(n.localEstimate(), n.Expected, n.Expected/100) {
+		// 	rounds++
+		// }
+		// n.Logger.Printf("Expected estimate %.2f\n", n.Expected)
+		// n.Logger.Printf("Current estimate %.2f\n", n.localEstimate())
+		// n.Logger.Printf("Rounds to converge %d\n", rounds)
 
 		for peer, msgs := range n.Msgs {
 			for _, msg := range msgs {
@@ -143,6 +145,31 @@ func (n *Node) sendMsgs() {
 		n.Msgs = make(map[hyparview.Peer][]FlowUpdate)
 		n.Lock.Unlock()
 	}
+}
+
+func (n *Node) setMetricsHandler(w http.ResponseWriter, r *http.Request) {
+	newMetrics, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Error reading request body", http.StatusInternalServerError)
+		return
+	}
+	defer r.Body.Close()
+	lines := strings.Split(string(newMetrics), "\n")
+	valStr := ""
+	for _, line := range lines {
+		if strings.HasPrefix(line, "app_memory_usage_bytes") {
+			valStr = strings.Split(line, " ")[1]
+			break
+		}
+	}
+	val, err := strconv.ParseFloat(valStr, 64)
+	if err != nil {
+		n.Logger.Println(err)
+	} else {
+		n.Logger.Println("new value", val)
+		n.Value = val
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func main() {
@@ -185,11 +212,6 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	expected, err := strconv.ParseFloat(cfg.Expected, 64)
-	if err != nil {
-		logger.Fatal(err)
-	}
-
 	node := &Node{
 		ID:        cfg.NodeID,
 		TAgg:      tAgg,
@@ -201,7 +223,6 @@ func main() {
 		Hyparview: hv,
 		Lock:      &sync.Mutex{},
 		Logger:    logger,
-		Expected:  expected,
 	}
 
 	hv.AddClientMsgHandler(FU_MSG_TYPE, func(msgBytes []byte, sender hyparview.Peer) {
@@ -221,6 +242,16 @@ func main() {
 		delete(node.Msgs, peer)
 	})
 
+	go func() {
+		for range time.NewTicker(time.Second).C {
+			node.exportMsgCount()
+			node.Lock.Lock()
+			value := node.localEstimate()
+			node.Lock.Unlock()
+			node.exportResult(value, 0, time.Now().UnixNano())
+		}
+	}()
+
 	err = hv.Join(cfg.ContactID, cfg.ContactAddr)
 	if err != nil {
 		logger.Fatal(err)
@@ -231,7 +262,11 @@ func main() {
 	go node.tick()
 	node.init()
 
-	select {}
+	r := http.NewServeMux()
+	r.HandleFunc("POST /metrics", node.setMetricsHandler)
+	log.Println("Metrics server listening on :9200/metrics")
+
+	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
 }
 
 func sum(m map[string]float64) float64 {
@@ -242,6 +277,61 @@ func sum(m map[string]float64) float64 {
 	return total
 }
 
-func equal(a, b, epsilon float64) bool {
-	return math.Abs(a-b) < epsilon
+// func equal(a, b, epsilon float64) bool {
+// 	return math.Abs(a-b) < epsilon
+// }
+
+var writers map[string]*csv.Writer = map[string]*csv.Writer{}
+
+func (n *Node) exportResult(value float64, reqTimestamp, rcvTimestamp int64) {
+	name := "value"
+	filename := fmt.Sprintf("/var/log/fu/results/%s.csv", name)
+	// defer file.Close()
+	writer := writers[filename]
+	if writer == nil {
+		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			n.Logger.Printf("failed to open/create file: %v", err)
+			return
+		}
+		writer = csv.NewWriter(file)
+		writers[filename] = writer
+	}
+	defer writer.Flush()
+	reqTsStr := strconv.Itoa(int(reqTimestamp))
+	rcvTsStr := strconv.Itoa(int(rcvTimestamp))
+	valStr := strconv.FormatFloat(value, 'f', -1, 64)
+	err := writer.Write([]string{"x", reqTsStr, rcvTsStr, valStr})
+	if err != nil {
+		n.Logger.Println(err)
+	}
+}
+
+func (n *Node) exportMsgCount() {
+	filename := "/var/log/fu/results/msg_count.csv"
+	// defer file.Close()
+	writer := writers[filename]
+	if writer == nil {
+		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			n.Logger.Printf("failed to open/create file: %v", err)
+			return
+		}
+		writer = csv.NewWriter(file)
+		writers[filename] = writer
+	}
+	defer writer.Flush()
+	tsStr := strconv.Itoa(int(time.Now().UnixNano()))
+	transport.MessagesSentLock.Lock()
+	sent := transport.MessagesSent - transport.MessagesSentSub
+	transport.MessagesSentLock.Unlock()
+	transport.MessagesRcvdLock.Lock()
+	rcvd := transport.MessagesRcvd - transport.MessagesRcvdSub
+	transport.MessagesRcvdLock.Unlock()
+	sentStr := strconv.Itoa(sent)
+	rcvdStr := strconv.Itoa(rcvd)
+	err := writer.Write([]string{tsStr, sentStr, rcvdStr})
+	if err != nil {
+		n.Logger.Println(err)
+	}
 }

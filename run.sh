@@ -28,12 +28,13 @@ fi
 CONTACT_NODE_ID="${REGION}_node_1"
 CONTACT_NODE_ADDR="${REGION}_node_1:6001"
 
-# compute expected average
-EXPECTED=$(echo "scale=2; ($COUNT+1)/2" | bc)
-
 for i in $(seq "$(($INDEX))" "$(($INDEX + $COUNT -1))"); do
     NAME="${REGION}_node_$i"
     LISTEN_ADDR="${NAME}:6001"
+
+    LOG="log/${NAME}"
+    rm -rf $LOG
+    mkdir -p $LOG/results
 
     echo "Starting container $NAME from image $IMAGE..."
     docker run -dit \
@@ -46,7 +47,7 @@ for i in $(seq "$(($INDEX))" "$(($INDEX + $COUNT -1))"); do
         -e CONTACT_NODE_ID="$CONTACT_NODE_ID" \
         -e CONTACT_NODE_ADDR="$CONTACT_NODE_ADDR" \
         -e LISTEN_ADDR="$LISTEN_ADDR" \
-        -e EXPECTED="$EXPECTED" \
+        -v "$(pwd)/${LOG}:/var/log/fu" \
         "$IMAGE"
 
     sleep 0.5
