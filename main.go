@@ -207,15 +207,16 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	val, err := strconv.Atoi(strings.Split(cfg.NodeID, "_")[2])
-	if err != nil {
-		logger.Fatal(err)
-	}
+	// val, err := strconv.Atoi(strings.Split(cfg.NodeID, "_")[2])
+	// if err != nil {
+	// 	logger.Fatal(err)
+	// }
 
 	node := &Node{
-		ID:        cfg.NodeID,
-		TAgg:      tAgg,
-		Value:     float64(val),
+		ID:    cfg.NodeID,
+		TAgg:  tAgg,
+		Value: 512,
+		// Value:     float64(val),
 		Flows:     make(map[string]float64),
 		Estimates: make(map[string]float64),
 		Rcvd:      make([]string, 0),
