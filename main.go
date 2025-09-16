@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,54 +32,49 @@ type Node struct {
 	Value     float64
 	Flows     map[string]float64
 	Estimates map[string]float64
-	Rcvd      []string
-	Ticks     int
-	Msgs      map[hyparview.Peer][]FlowUpdate
+	Ticks     map[string]int
+	Rcvd      map[hyparview.Peer]FlowUpdate
 	Hyparview *hyparview.HyParView
 	Lock      *sync.Mutex
 	Logger    *log.Logger
 }
 
-func (n *Node) localEstimate() float64 {
-	return n.Value - sum(n.Flows)
+func (n *Node) sumFlows() float64 {
+	total := 0.0
+	for _, f := range n.Flows {
+		total += f
+	}
+	return total
 }
 
-func (n *Node) rcvdAll() bool {
-	for _, peer := range n.Hyparview.GetPeers(1000) {
-		if !slices.Contains(n.Rcvd, peer.Node.ID) {
-			return false
-		}
-	}
-	return true
+func (n *Node) localEstimate() float64 {
+	return n.Value - n.sumFlows()
 }
 
 func (n *Node) init() {
 	n.Lock.Lock()
 	defer n.Lock.Unlock()
 	activePeers := n.Hyparview.GetPeers(10000)
-	if len(activePeers) == 0 {
-		n.Logger.Println("no peers")
-		return
-	}
 	for _, peer := range activePeers {
-		n.Msgs[peer] = append(n.Msgs[peer], FlowUpdate{
+		msg := FlowUpdate{
 			NodeID:   n.ID,
 			Flow:     0,
 			Estimate: n.Value,
+		}
+		err := peer.Conn.Send(data.Message{
+			Type:    FU_MSG_TYPE,
+			Payload: msg,
 		})
+		if err != nil {
+			n.Logger.Println(err)
+		}
 	}
 }
 
-func (n *Node) receive(msg FlowUpdate) {
-	n.Lock.Lock()
-	defer n.Lock.Unlock()
-
+func (n *Node) receive(msg FlowUpdate, peer hyparview.Peer) {
 	n.Estimates[msg.NodeID] = msg.Estimate
 	n.Flows[msg.NodeID] = -msg.Flow
-	n.Rcvd = append(n.Rcvd, msg.NodeID)
-	if n.rcvdAll() {
-		n.avgAndSend()
-	}
+	n.avgAndSend(peer)
 }
 
 func (n *Node) tick() {
@@ -89,60 +83,52 @@ func (n *Node) tick() {
 
 	for range ticker.C {
 		n.Lock.Lock()
-		n.Ticks += 1
-		if n.Ticks > 3 {
-			n.avgAndSend()
+		activePeers := n.Hyparview.GetPeers(10000)
+		for _, peer := range activePeers {
+			n.Ticks[peer.Node.ID] = n.Ticks[peer.Node.ID] + 1
+			if n.Ticks[peer.Node.ID] > 3 {
+				n.avgAndSend(peer)
+			}
 		}
 		n.Lock.Unlock()
 	}
 }
 
-func (n *Node) avgAndSend() {
-	peers := n.Hyparview.GetPeers(1000)
+func (n *Node) avgAndSend(peer hyparview.Peer) {
+	peerID := peer.Node.ID
 
 	e := n.localEstimate()
-	a := (e + sum(n.Estimates)) / (float64(len(peers)) + 1)
-	for _, peer := range peers {
-		peerID := peer.Node.ID
-		n.Flows[peerID] = n.Flows[peerID] + a - n.Estimates[peerID]
-		n.Estimates[peerID] = a
-		n.Msgs[peer] = append(n.Msgs[peer], FlowUpdate{
-			NodeID:   n.ID,
-			Flow:     n.Flows[peerID],
-			Estimate: a,
-		})
+	a := (n.Estimates[peerID] + e) / 2
+	n.Flows[peerID] = n.Flows[peerID] + a - n.Estimates[peerID]
+	n.Estimates[peerID] = a
+	n.Ticks[peerID] = 0
+
+	msg := FlowUpdate{
+		NodeID:   n.ID,
+		Flow:     n.Flows[peerID],
+		Estimate: a,
 	}
-	n.Rcvd = make([]string, 0)
-	n.Ticks = 0
+	err := peer.Conn.Send(data.Message{
+		Type:    FU_MSG_TYPE,
+		Payload: msg,
+	})
+	if err != nil {
+		n.Logger.Println(err)
+	}
 }
 
-func (n *Node) sendMsgs() {
+func (n *Node) process() {
 	ticker := time.NewTicker(time.Duration(n.TAgg) * time.Second)
 	defer ticker.Stop()
 
-	// rounds := 0
-
 	for range ticker.C {
 		n.Lock.Lock()
-		// if !equal(n.localEstimate(), n.Expected, n.Expected/100) {
-		// 	rounds++
-		// }
-		// n.Logger.Printf("Expected estimate %.2f\n", n.Expected)
-		// n.Logger.Printf("Current estimate %.2f\n", n.localEstimate())
-		// n.Logger.Printf("Rounds to converge %d\n", rounds)
-
-		for peer, msgs := range n.Msgs {
-			for _, msg := range msgs {
-				err := peer.Conn.Send(data.Message{
-					Type:    FU_MSG_TYPE,
-					Payload: msg,
-				})
-				if err != nil {
-					n.Logger.Println(err)
-				}
-			}
+		for peer, msg := range n.Rcvd {
+			n.receive(msg, peer)
 		}
-		n.Msgs = make(map[hyparview.Peer][]FlowUpdate)
+		n.Logger.Printf("Current estimate %.2f\n", n.localEstimate())
+		n.Logger.Printf("Sent %d\n", transport.MessagesSent)
+		n.Logger.Printf("Rcvd %d\n", transport.MessagesRcvd)
 		n.Lock.Unlock()
 	}
 }
@@ -213,14 +199,13 @@ func main() {
 	}
 
 	node := &Node{
-		ID:   cfg.NodeID,
-		TAgg: tAgg,
-		// Value: 512,
+		ID:        cfg.NodeID,
+		TAgg:      tAgg,
 		Value:     float64(val),
 		Flows:     make(map[string]float64),
 		Estimates: make(map[string]float64),
-		Rcvd:      make([]string, 0),
-		Msgs:      make(map[hyparview.Peer][]FlowUpdate),
+		Ticks:     make(map[string]int),
+		Rcvd:      make(map[hyparview.Peer]FlowUpdate),
 		Hyparview: hv,
 		Lock:      &sync.Mutex{},
 		Logger:    logger,
@@ -233,14 +218,17 @@ func main() {
 			logger.Println(node.ID, "-", "Error unmarshaling message:", err)
 			return
 		}
-		node.receive(msg)
+		node.Lock.Lock()
+		defer node.Lock.Unlock()
+		node.Rcvd[sender] = msg
 	})
 	hv.OnPeerDown(func(peer hyparview.Peer) {
 		node.Lock.Lock()
 		defer node.Lock.Unlock()
 		delete(node.Estimates, peer.Node.ID)
 		delete(node.Flows, peer.Node.ID)
-		delete(node.Msgs, peer)
+		delete(node.Ticks, peer.Node.ID)
+		delete(node.Rcvd, peer)
 	})
 
 	go func() {
@@ -257,9 +245,8 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
-	time.Sleep(20 * time.Second)
 
-	go node.sendMsgs()
+	go node.process()
 	go node.tick()
 	node.init()
 
@@ -276,18 +263,6 @@ func main() {
 	log.Println("State server listening on :5001/state")
 	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":5001", r2))
 }
-
-func sum(m map[string]float64) float64 {
-	total := 0.0
-	for _, f := range m {
-		total += f
-	}
-	return total
-}
-
-// func equal(a, b, epsilon float64) bool {
-// 	return math.Abs(a-b) < epsilon
-// }
 
 var writers map[string]*csv.Writer = map[string]*csv.Writer{}
 
