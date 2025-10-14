@@ -268,7 +268,7 @@ var writers map[string]*csv.Writer = map[string]*csv.Writer{}
 
 func (n *Node) exportResult(value float64, reqTimestamp, rcvTimestamp int64) {
 	name := "value"
-	filename := fmt.Sprintf("/var/log/fu/results/%s.csv", name)
+	filename := fmt.Sprintf("/var/log/monoceros/results/%s.csv", name)
 	// defer file.Close()
 	writer := writers[filename]
 	if writer == nil {
@@ -291,7 +291,7 @@ func (n *Node) exportResult(value float64, reqTimestamp, rcvTimestamp int64) {
 }
 
 func (n *Node) exportMsgCount() {
-	filename := "/var/log/fu/results/msg_count.csv"
+	filename := "/var/log/monoceros/results/msg_count.csv"
 	// defer file.Close()
 	writer := writers[filename]
 	if writer == nil {
