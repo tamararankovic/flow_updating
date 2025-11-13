@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -12,18 +13,43 @@ import (
 	"sync"
 	"time"
 
-	"github.com/c12s/hyparview/data"
-	"github.com/c12s/hyparview/hyparview"
-	"github.com/c12s/hyparview/transport"
-	"github.com/caarlos0/env"
+	"github.com/tamararankovic/flow_updating/config"
+	"github.com/tamararankovic/flow_updating/peers"
 )
 
-const FU_MSG_TYPE data.MessageType = data.UNKNOWN + 1
+const FU_MSG_TYPE int8 = 1
+
+type Msg interface {
+	Type() int8
+}
 
 type FlowUpdate struct {
 	NodeID   string
 	Flow     float64
 	Estimate float64
+}
+
+func (m FlowUpdate) Type() int8 {
+	return FU_MSG_TYPE
+}
+
+func MsgToBytes(msg Msg) []byte {
+	msgBytes, _ := json.Marshal(&msg)
+	return append([]byte{byte(msg.Type())}, msgBytes...)
+}
+
+func BytesToMsg(msgBytes []byte) Msg {
+	msgType := int8(msgBytes[0])
+	var msg Msg
+	switch msgType {
+	case FU_MSG_TYPE:
+		msg = &FlowUpdate{}
+	}
+	if msg == nil {
+		return nil
+	}
+	json.Unmarshal(msgBytes[1:], msg)
+	return msg
 }
 
 type Node struct {
@@ -33,10 +59,9 @@ type Node struct {
 	Flows     map[string]float64
 	Estimates map[string]float64
 	Ticks     map[string]int
-	Rcvd      map[hyparview.Peer]FlowUpdate
-	Hyparview *hyparview.HyParView
+	Rcvd      map[peers.Peer]*FlowUpdate
+	Peers     *peers.Peers
 	Lock      *sync.Mutex
-	Logger    *log.Logger
 }
 
 func (n *Node) sumFlows() float64 {
@@ -54,24 +79,18 @@ func (n *Node) localEstimate() float64 {
 func (n *Node) init() {
 	n.Lock.Lock()
 	defer n.Lock.Unlock()
-	activePeers := n.Hyparview.GetPeers(10000)
+	activePeers := n.Peers.GetPeers()
 	for _, peer := range activePeers {
 		msg := FlowUpdate{
 			NodeID:   n.ID,
 			Flow:     0,
 			Estimate: n.Value,
 		}
-		err := peer.Conn.Send(data.Message{
-			Type:    FU_MSG_TYPE,
-			Payload: msg,
-		})
-		if err != nil {
-			n.Logger.Println(err)
-		}
+		peer.Send(MsgToBytes(msg))
 	}
 }
 
-func (n *Node) receive(msg FlowUpdate, peer hyparview.Peer) {
+func (n *Node) receive(msg FlowUpdate, peer peers.Peer) {
 	n.Estimates[msg.NodeID] = msg.Estimate
 	n.Flows[msg.NodeID] = -msg.Flow
 	n.avgAndSend(peer)
@@ -83,10 +102,10 @@ func (n *Node) tick() {
 
 	for range ticker.C {
 		n.Lock.Lock()
-		activePeers := n.Hyparview.GetPeers(10000)
+		activePeers := n.Peers.GetPeers()
 		for _, peer := range activePeers {
-			n.Ticks[peer.Node.ID] = n.Ticks[peer.Node.ID] + 1
-			if n.Ticks[peer.Node.ID] > 3 {
+			n.Ticks[peer.GetID()] = n.Ticks[peer.GetID()] + 1
+			if n.Ticks[peer.GetID()] > 3 {
 				n.avgAndSend(peer)
 			}
 		}
@@ -94,8 +113,8 @@ func (n *Node) tick() {
 	}
 }
 
-func (n *Node) avgAndSend(peer hyparview.Peer) {
-	peerID := peer.Node.ID
+func (n *Node) avgAndSend(peer peers.Peer) {
+	peerID := peer.GetID()
 
 	e := n.localEstimate()
 	a := (n.Estimates[peerID] + e) / 2
@@ -108,13 +127,7 @@ func (n *Node) avgAndSend(peer hyparview.Peer) {
 		Flow:     n.Flows[peerID],
 		Estimate: a,
 	}
-	err := peer.Conn.Send(data.Message{
-		Type:    FU_MSG_TYPE,
-		Payload: msg,
-	})
-	if err != nil {
-		n.Logger.Println(err)
-	}
+	peer.Send(MsgToBytes(msg))
 }
 
 func (n *Node) process() {
@@ -124,11 +137,11 @@ func (n *Node) process() {
 	for range ticker.C {
 		n.Lock.Lock()
 		for peer, msg := range n.Rcvd {
-			n.receive(msg, peer)
+			n.receive(*msg, peer)
 		}
-		n.Logger.Printf("Current estimate %.2f\n", n.localEstimate())
-		n.Logger.Printf("Sent %d\n", transport.MessagesSent)
-		n.Logger.Printf("Rcvd %d\n", transport.MessagesRcvd)
+		log.Printf("Current estimate %.2f\n", n.localEstimate())
+		log.Printf("Sent %d\n", peers.MessagesSent)
+		log.Printf("Rcvd %d\n", peers.MessagesRcvd)
 		n.Lock.Unlock()
 	}
 }
@@ -150,86 +163,76 @@ func (n *Node) setMetricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	val, err := strconv.ParseFloat(valStr, 64)
 	if err != nil {
-		n.Logger.Println(err)
+		log.Println(err)
 	} else {
-		n.Logger.Println("new value", val)
+		log.Println("new value", val)
 		n.Value = val
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
 func main() {
-	hvConfig := hyparview.Config{}
-	err := env.Parse(&hvConfig)
+	time.Sleep(10 * time.Second)
+
+	cfg := config.LoadConfigFromEnv()
+	params := config.LoadParamsFromEnv()
+
+	ps, err := peers.NewPeers(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	cfg := Config{}
-	err = env.Parse(&cfg)
+	val, err := strconv.Atoi(params.ID)
 	if err != nil {
 		log.Fatal(err)
-	}
-
-	self := data.Node{
-		ID:            cfg.NodeID,
-		ListenAddress: cfg.ListenAddr,
-	}
-
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile)
-
-	gnConnManager := transport.NewConnManager(
-		transport.NewTCPConn,
-		transport.AcceptTcpConnsFn(self.ListenAddress),
-	)
-
-	hv, err := hyparview.NewHyParView(hvConfig, self, gnConnManager, logger)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	tAgg, err := strconv.Atoi(cfg.TAgg)
-	if err != nil {
-		logger.Fatal(err)
-	}
-
-	val, err := strconv.Atoi(strings.Split(cfg.NodeID, "_")[2])
-	if err != nil {
-		logger.Fatal(err)
 	}
 
 	node := &Node{
-		ID:        cfg.NodeID,
-		TAgg:      tAgg,
+		ID:        params.ID,
+		TAgg:      params.Tagg,
 		Value:     float64(val),
 		Flows:     make(map[string]float64),
 		Estimates: make(map[string]float64),
 		Ticks:     make(map[string]int),
-		Rcvd:      make(map[hyparview.Peer]FlowUpdate),
-		Hyparview: hv,
+		Rcvd:      make(map[peers.Peer]*FlowUpdate),
+		Peers:     ps,
 		Lock:      &sync.Mutex{},
-		Logger:    logger,
 	}
 
-	hv.AddClientMsgHandler(FU_MSG_TYPE, func(msgBytes []byte, sender hyparview.Peer) {
-		msg := FlowUpdate{}
-		err := transport.Deserialize(msgBytes, &msg)
-		if err != nil {
-			logger.Println(node.ID, "-", "Error unmarshaling message:", err)
-			return
+	lastRcvd := make(map[string]int)
+	round := 0
+
+	// handle messages
+	go func() {
+		for msgRcvd := range ps.Messages {
+			msg := BytesToMsg(msgRcvd.MsgBytes)
+			if msg == nil {
+				continue
+			}
+			lastRcvd[msgRcvd.Sender.GetID()] = round
+			node.Lock.Lock()
+			node.Rcvd[msgRcvd.Sender] = msg.(*FlowUpdate)
+			node.Lock.Unlock()
 		}
-		node.Lock.Lock()
-		defer node.Lock.Unlock()
-		node.Rcvd[sender] = msg
-	})
-	hv.OnPeerDown(func(peer hyparview.Peer) {
-		node.Lock.Lock()
-		defer node.Lock.Unlock()
-		delete(node.Estimates, peer.Node.ID)
-		delete(node.Flows, peer.Node.ID)
-		delete(node.Ticks, peer.Node.ID)
-		delete(node.Rcvd, peer)
-	})
+	}()
+
+	// remove failed peers
+	go func() {
+		for range time.NewTicker(time.Second).C {
+			round++
+			for _, peer := range ps.GetPeers() {
+				if lastRcvd[peer.GetID()]+params.Rmax < round && round > 10 {
+					ps.PeerFailed(peer.GetID())
+					node.Lock.Lock()
+					delete(node.Estimates, peer.GetID())
+					delete(node.Flows, peer.GetID())
+					delete(node.Ticks, peer.GetID())
+					delete(node.Rcvd, peer)
+					node.Lock.Unlock()
+				}
+			}
+		}
+	}()
 
 	go func() {
 		for range time.NewTicker(time.Second).C {
@@ -241,11 +244,6 @@ func main() {
 		}
 	}()
 
-	err = hv.Join(cfg.ContactID, cfg.ContactAddr)
-	if err != nil {
-		logger.Fatal(err)
-	}
-
 	go node.process()
 	go node.tick()
 	node.init()
@@ -254,27 +252,19 @@ func main() {
 	r.HandleFunc("POST /metrics", node.setMetricsHandler)
 	log.Println("Metrics server listening on :9200/metrics")
 
-	go func() {
-		log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
-	}()
-
-	r2 := http.NewServeMux()
-	r2.HandleFunc("GET /state", node.StateHandler)
-	log.Println("State server listening on :5001/state")
-	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":5001", r2))
+	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
 }
 
 var writers map[string]*csv.Writer = map[string]*csv.Writer{}
 
 func (n *Node) exportResult(value float64, reqTimestamp, rcvTimestamp int64) {
 	name := "value"
-	filename := fmt.Sprintf("/var/log/monoceros/results/%s.csv", name)
-	// defer file.Close()
+	filename := fmt.Sprintf("/var/log/flow_updating/%s.csv", name)
 	writer := writers[filename]
 	if writer == nil {
 		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
-			n.Logger.Printf("failed to open/create file: %v", err)
+			log.Printf("failed to open/create file: %v", err)
 			return
 		}
 		writer = csv.NewWriter(file)
@@ -286,18 +276,17 @@ func (n *Node) exportResult(value float64, reqTimestamp, rcvTimestamp int64) {
 	valStr := strconv.FormatFloat(value, 'f', -1, 64)
 	err := writer.Write([]string{"x", reqTsStr, rcvTsStr, valStr})
 	if err != nil {
-		n.Logger.Println(err)
+		log.Println(err)
 	}
 }
 
 func (n *Node) exportMsgCount() {
-	filename := "/var/log/monoceros/results/msg_count.csv"
-	// defer file.Close()
+	filename := "/var/log/flow_updating/msg_count.csv"
 	writer := writers[filename]
 	if writer == nil {
 		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
-			n.Logger.Printf("failed to open/create file: %v", err)
+			log.Printf("failed to open/create file: %v", err)
 			return
 		}
 		writer = csv.NewWriter(file)
@@ -305,16 +294,16 @@ func (n *Node) exportMsgCount() {
 	}
 	defer writer.Flush()
 	tsStr := strconv.Itoa(int(time.Now().UnixNano()))
-	transport.MessagesSentLock.Lock()
-	sent := transport.MessagesSent - transport.MessagesSentSub
-	transport.MessagesSentLock.Unlock()
-	transport.MessagesRcvdLock.Lock()
-	rcvd := transport.MessagesRcvd - transport.MessagesRcvdSub
-	transport.MessagesRcvdLock.Unlock()
+	peers.MessagesSentLock.Lock()
+	sent := peers.MessagesSent
+	peers.MessagesSentLock.Unlock()
+	peers.MessagesRcvdLock.Lock()
+	rcvd := peers.MessagesRcvd
+	peers.MessagesRcvdLock.Unlock()
 	sentStr := strconv.Itoa(sent)
 	rcvdStr := strconv.Itoa(rcvd)
 	err := writer.Write([]string{tsStr, sentStr, rcvdStr})
 	if err != nil {
-		n.Logger.Println(err)
+		log.Println(err)
 	}
 }
